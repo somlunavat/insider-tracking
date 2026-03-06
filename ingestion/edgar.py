@@ -463,7 +463,134 @@ def ingest_new_filings(since_date: date = None) -> int:
     return new_count
 
 
-# --- Utility: query local DB for reactive mode (used by Module 4) --------
+# --- Ticker-specific EDGAR fetch (used by Module 4 reactive mode) ---------
+
+# Cache the company tickers map for the lifetime of the process
+_company_tickers_cache: dict = {}
+
+
+def _load_company_tickers() -> dict:
+    """Load SEC company tickers JSON (ticker → {cik_str, title})."""
+    global _company_tickers_cache
+    if _company_tickers_cache:
+        return _company_tickers_cache
+    resp = _get("https://www.sec.gov/files/company_tickers.json")
+    if resp:
+        raw = resp.json()
+        # Re-key by uppercase ticker for O(1) lookup
+        _company_tickers_cache = {
+            v["ticker"].upper(): v for v in raw.values() if v.get("ticker")
+        }
+    return _company_tickers_cache
+
+
+def resolve_ticker_info(ticker: str) -> tuple:
+    """
+    Return (cik, company_name) for a ticker using SEC company tickers JSON.
+    Returns (None, None) if not found.
+    """
+    tickers = _load_company_tickers()
+    entry = tickers.get(ticker.upper())
+    if not entry:
+        return None, None
+    return str(entry["cik_str"]), entry.get("title", "")
+
+
+def ingest_ticker_filings(ticker: str, months: int = 12) -> int:
+    """
+    Fetch and store Form 4 filings for a specific ticker from EDGAR.
+
+    Uses SEC company tickers JSON to resolve the company name, then searches
+    EFTS with an entity filter. Falls back to ticker as entity name if lookup fails.
+    Only stores filings whose parsed ticker matches exactly.
+
+    Returns count of new filings stored.
+    """
+    since_date = date.today() - timedelta(days=months * 30)
+
+    _, company_name = resolve_ticker_info(ticker)
+    entity_query = company_name or ticker
+
+    logger.info(
+        "Fetching EDGAR Form 4s for %s (entity=%r) since %s",
+        ticker, entity_query, since_date,
+    )
+
+    metadata_list = []
+    page_size = 100
+    from_offset = 0
+
+    while True:
+        resp = _get(EFTS_SEARCH_URL, params={
+            "forms": "4",
+            "dateRange": "custom",
+            "startdt": since_date.isoformat(),
+            "enddt": date.today().isoformat(),
+            "entity": entity_query,
+            "from": from_offset,
+        })
+        if resp is None:
+            break
+
+        data = resp.json()
+        hits = data.get("hits", {}).get("hits", [])
+        total = data.get("hits", {}).get("total", {}).get("value", 0)
+
+        if not hits:
+            break
+
+        for hit in hits:
+            source = hit.get("_source", {})
+            accession_number = source.get("adsh") or hit.get("_id", "").split(":")[0]
+            if not accession_number:
+                continue
+            filer_cik = str(int(accession_number.replace("-", "")[:10]))
+            metadata_list.append({
+                "accession_number": accession_number,
+                "filer_cik": filer_cik,
+                "date_filed": source.get("file_date", ""),
+            })
+
+        from_offset += len(hits)
+        if from_offset >= total or len(hits) < page_size:
+            break
+
+    logger.info("EFTS entity search [%s]: found %d filings", ticker, len(metadata_list))
+
+    new_count = errors = 0
+    for meta in metadata_list:
+        accession_number = meta["accession_number"]
+
+        with get_db() as conn:
+            if conn.execute(
+                "SELECT id FROM filings WHERE accession_number = ?", (accession_number,)
+            ).fetchone():
+                continue
+
+        xml_content = fetch_form4_xml(meta["filer_cik"], accession_number)
+        if not xml_content:
+            errors += 1
+            continue
+
+        parsed = parse_form4_xml(xml_content, accession_number, meta["date_filed"])
+        if not parsed:
+            continue
+
+        # Only store filings whose issuer ticker matches exactly
+        if parsed["filing"].get("ticker", "").upper() != ticker.upper():
+            continue
+
+        filing_id = store_filing(parsed)
+        if filing_id:
+            new_count += 1
+
+    logger.info(
+        "Ticker ingestion [%s]: %d new filings stored (%d errors)", ticker, new_count, errors
+    )
+    return new_count
+
+
+# --- Utility: query local DB for reactive mode (used by Module 4) ---------
 
 def get_filings_by_ticker(ticker: str) -> list[dict]:
     """Return all stored filings + transactions for a given ticker."""

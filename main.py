@@ -17,6 +17,7 @@ import config
 from database.db import init_db
 from ingestion.edgar import ingest_new_filings
 from ingestion.enricher import enrich_new_filings
+from scoring.engine import score_new_trades
 
 # Ensure log directory exists before configuring handlers
 os.makedirs(os.path.dirname(config.LOG_FILE), exist_ok=True)
@@ -60,4 +61,6 @@ if __name__ == "__main__":
     logger.info("%d new filing(s) ingested.", ingested)
 
     enriched = enrich_new_filings()
-    logger.info("=== Done. %d ingested | %d enriched. ===", ingested, enriched)
+
+    scored = score_new_trades()
+    logger.info("=== Done. %d ingested | %d enriched | %d scored. ===", ingested, enriched, scored)
